@@ -1,0 +1,105 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper: Check if request is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Helper: Check if user owns the document
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Normalize string: trim, convert to lowercase, and replace forward slashes with underscore
+    function normalize(str) {
+      return str.trim().lower().replace('/', '_');
+    }
+
+    // Deterministic Document ID formula: userId_normalizedTitle_normalizedAuthor
+    function expectedDocId(userId, title, author) {
+      return userId + '_' + normalize(title) + '_' + normalize(author);
+    }
+
+    // Validate complete book schema and field constraints
+    function isValidBook(data, docId) {
+      return data.keys().hasAll(['id', 'userId', 'title', 'author', 'genre', 'status', 'favorite', 'createdAt'])
+        // ID field inside doc must strictly match document ID in path
+        && data.id is string
+        && data.id == docId
+
+        // User ownership: must match authenticated user UID
+        && data.userId is string
+        && data.userId == request.auth.uid
+
+        // Title: string, non-empty after trim, max 100 characters
+        && data.title is string
+        && data.title.trim().size() > 0
+        && data.title.size() <= 100
+
+        // Author: string, non-empty after trim, max 60 characters
+        && data.author is string
+        && data.author.trim().size() > 0
+        && data.author.size() <= 60
+
+        // Genre: must be one of the four allowed categories
+        && data.genre is string
+        && data.genre in ['Fiction', 'Non-Fiction', 'Academic', 'Other']
+
+        // Status: must be one of the three allowed reading stages
+        && data.status is string
+        && data.status in ['To Read', 'Reading', 'Finished']
+
+        // Favorite: must be boolean
+        && data.favorite is bool
+
+        // Rating: optional or null; if present, must be integer between 0 and 5
+        && (!('rating' in data) || data.rating == null || (data.rating is int && data.rating >= 0 && data.rating <= 5))
+
+        // Notes: optional or null; if present, must be string with max 300 characters
+        && (!('notes' in data) || data.notes == null || (data.notes is string && data.notes.size() <= 300))
+
+        // CreatedAt: must be timestamp
+        && data.createdAt is timestamp;
+    }
+
+    // Rules for books collection
+    match /books/{bookId} {
+      // Read & list allowed only when filtered by owner's userId
+      allow read: if isOwner(resource.data.userId);
+
+      // Create allowed only if:
+      // 1. Authenticated as the declared userId
+      // 2. Document ID matches deterministic formula (userId_title_author)
+      // 3. Document does not already exist (!exists) to prevent duplicate title+author
+      // 4. All field constraints pass validation
+      allow create: if isOwner(request.resource.data.userId)
+        && bookId == expectedDocId(request.auth.uid, request.resource.data.title, request.resource.data.author)
+        && isValidBook(request.resource.data, bookId)
+        && !exists(/databases/$(database)/documents/books/$(bookId));
+
+      // Update allowed only if:
+      // 1. User owns the existing and updated resource
+      // 2. Cannot alter id, userId, createdAt, title, or author in-place
+      // 3. Resulting document data passes schema validation
+      allow update: if isOwner(resource.data.userId)
+        && isOwner(request.resource.data.userId)
+        && request.resource.data.id == resource.data.id
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.title == resource.data.title
+        && request.resource.data.author == resource.data.author
+        && isValidBook(request.resource.data, bookId);
+
+      // Delete allowed only by owner
+      allow delete: if isOwner(resource.data.userId);
+    }
+
+    // Default deny: all other paths are locked down
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
